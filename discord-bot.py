@@ -12,10 +12,7 @@ from io import BytesIO
 from discord.ext import voice_recv, commands
 from ollama import AsyncClient, ChatResponse
 
-ollama_host = "localhost"
-tts_host = "http://localhost:8880/v1/audio/speech"
-
-#### Speech model settings ####
+#### ollama settings ####
 # num_keep = 5
 # num_predict = 20
 # top_k = 20
@@ -43,14 +40,10 @@ repeat_penalty = 1.2
 # use_mlock = False
 # num_thread = 8
 
-ollama_options = {'temperature': temperature, 'repeat_penalty': repeat_penalty}
+ollama_host = "localhost"
 ollama_client = AsyncClient(host=ollama_host)
-
-# TTS Speed
-speed = 1.0
-
-# Vosk bitrate
-rate = 96000
+ollama_options = {'temperature': temperature, 'repeat_penalty': repeat_penalty}
+tts_host = "http://localhost:8880/v1/audio/speech"
 
 config = configparser.ConfigParser()
 if os.path.exists("config.ini"):
@@ -65,7 +58,6 @@ voice_id = config.getint('DISCORD', 'voice_id')
 command_prefix = config['OTHER']['command_prefix']
 text_model = config['OTHER']['text_model']
 
-speaking = False
 audio_processing = False
 text_output = False
 trigger_phrase_state = False
@@ -93,7 +85,7 @@ def callback(user, data: voice_recv.VoiceData):
     audio_processing = True
 
 async def process_audio():
-    global pcm_buffer, audio_processing
+    global pcm_buffer
     message_queue = ""
     partial_result = {'partial': ''}
     while True:
@@ -119,7 +111,6 @@ async def process_audio():
                         pcm_buffer[index] = b""
                     elif (time.time() - last_audio_time > .02) and not partial_result['partial']:
                         same_user = False
-                        # break
                     elif (time.time() - last_audio_time > .4) and partial_result['partial']:
                         silence = b"\x00" * 4000
                         pcm_buffer[index] += silence
@@ -127,47 +118,44 @@ async def process_audio():
             if message_queue and not any(len(item) > 16000 for item in pcm_buffer):
                 if trigger_phrase in message_queue or not trigger_phrase_state:
                     try:
-                        response_message = await get_ollama_response()
+                        response_message = await get_ollama_response(history)
                         try:
                             await get_tts_response(voice, response_message)
-                        except:
+                        except Exception as e:
+                            print(e)
                             print("Unable to connect to TTS, check that docker is running")
-                    except:
+                    except Exception as e:
+                        print(e)
                         print("Unable to connect to ollama, check that the service is running")
 
                 message_queue = ""
         await asyncio.sleep(0)
 
-async def get_ollama_response():
+async def get_ollama_response(history):
     temp_history = history.copy()
     temp_history.insert(0, {"role": "system", "content": system_prompt})
-    if len(temp_history) > 8000:
-        print(f"histroy length is {len(temp_history)} system prompt is probably getting cut")
     response: ChatResponse = await ollama_client.chat(model=text_model, messages=temp_history, keep_alive='10m', options=ollama_options)
     cleaned_message = re.sub(r"\*.*?\*", "", re.sub(r"\[.*?\]", "", response.message.content))
     await write_history("assistant", cleaned_message)
     return cleaned_message
 
 async def get_tts_response(voice, text):
-    global voice_client
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            tts_host,
-            json={
-                "model": "kokoro",
-                "input": text,
-                "voice": voice,
-                "response_format": "wav",
-                "speed": speed
-            }
-        ) as response:
-            audio_data = await response.read()
-            audio_buffer = BytesIO(audio_data)
+    async with aiohttp_session.post(
+        tts_host,
+        json={
+            "model": "kokoro",
+            "input": text,
+            "voice": voice,
+            "response_format": "wav",
+            "speed": 1.0
+        }
+    ) as response:
+        audio_data = await response.read()
+        audio_buffer = BytesIO(audio_data)
     while voice_client.is_playing():
         await asyncio.sleep(.1)
     source = discord.FFmpegPCMAudio(audio_buffer, pipe=True)
     voice_client.play(source)
-
 
 async def load_character():
     global character, voice, system_prompt, trigger_phrase
@@ -178,8 +166,9 @@ async def load_character():
     system_prompt = card["system_prompt"]
     trigger_phrase = card["trigger_phrase"]
 
-async def initialize_vosk(rate):
+async def initialize_vosk():
     global rec
+    rate = 96000
     # Small model (faster loading)
     model = vosk.Model(model_name="vosk-model-small-en-us-0.15")
     # Normal model
@@ -187,30 +176,26 @@ async def initialize_vosk(rate):
     rec = vosk.KaldiRecognizer(model, rate)
 
 async def write_history(role, message):
+    global history
     print(message)
-    global history, text_channel
     history.append({"role": role, "content": message})
     if text_output:
-        if role == "assistant":
-            await text_channel.send(f"{message}")
-        else:
-            await text_channel.send(f"{role} says: {message}")
-
+        await text_channel.send(message)
 
 #### DISCORD ####
 @bot.event
 async def on_ready():
-    global text_channel, voice_channel
+    global text_channel, voice_channel, aiohttp_session
+    aiohttp_session = aiohttp.ClientSession()
     text_channel = bot.get_channel(text_id)
     voice_channel = bot.get_channel(voice_id)
     await load_character()
-    await initialize_vosk(rate)
+    await initialize_vosk()
     asyncio.create_task(process_audio())
     print("Discord Client Ready")
 
 @bot.event
 async def on_voice_state_update(member, before, after):
-    global voice_channel
     if member == bot.user:
         return
     if before.channel != voice_channel and after.channel == voice_channel:
@@ -222,13 +207,12 @@ async def on_voice_state_update(member, before, after):
 
 @bot.command(name="connect", help="connect to the voice channel")
 async def connect(ctx):
-    global voice_channel, voice_client
+    global voice_client
     voice_client = await voice_channel.connect(cls=voice_recv.VoiceRecvClient)
     voice_client.listen(voice_recv.BasicSink(callback))
 
 @bot.command(name="disconnect", help="disconnect from the voice channel")
 async def disconnect(ctx):
-    global voice_client
     await voice_client.disconnect()
 
 @bot.command(name="refresh", help="load changes to system prompt or voice")
@@ -237,7 +221,7 @@ async def refresh_character(ctx):
     await ctx.send("character refreshed")
 
 @bot.command(name="text_log", help="log all voice messages to text channel")
-async def text_logging(ctx):
+async def text_log(ctx):
     global text_output
     if text_output:
         text_output = False
@@ -247,7 +231,7 @@ async def text_logging(ctx):
         await ctx.send("text logging enabled")
 
 @bot.command(name="trigger_phrase", help="prevent responses unless trigger phrase is spoken")
-async def gui_trigger_phrase(ctx):
+async def func_trigger_phrase(ctx):
     global trigger_phrase_state
     if trigger_phrase_state:
         trigger_phrase_state = False
@@ -256,10 +240,10 @@ async def gui_trigger_phrase(ctx):
         trigger_phrase_state = True
         await ctx.send("trigger phrase enabled")
 
-@bot.command(name="memory_reset", help="clears current memory")
-async def delete_history(ctx):
+@bot.command(name="reset_memory", help="clears current memory")
+async def reset_memory(ctx):
     global history
-    await ctx.send("memory reset")
+    await ctx.send("memory has been reset")
     history = []
 
 
