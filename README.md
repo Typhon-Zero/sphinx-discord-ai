@@ -6,6 +6,15 @@ https://www.docker.com/products/docker-desktop/
 ## Install Ollama
 https://ollama.com/download
 
+## Install ffmpeg
+   https://www.ffmpeg.org/download.html
+   
+   https://www.gyan.dev/ffmpeg/builds/ffmpeg-git-full.7z
+   
+   extract to C:\ffmpeg
+   
+   add C:\ffmpeg\bin to path
+
 ## Set Up Kokoro
   https://github.com/remsky/Kokoro-FastAPI
   
